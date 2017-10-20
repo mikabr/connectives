@@ -1,0 +1,9 @@
+- AND/OR are primitives, everything is derived from them
+  MDL for each non-primitive connective = cost
+- non-uniform prior over meanings: predicates tend to be false
+
+
+negation as primitive
+lexica of size 1, 2, 3, 4
+search for alpha, primitives (a few value of lambda?)
+baseline of with no RSA
