@@ -3,9 +3,9 @@ title: "Logical Connectives"
 author: "Mika Braginsky"
 date: "June 13, 2017"
 output: 
-  html_notebook: 
-    highlight: tango
-    theme: spacelab
+html_notebook: 
+highlight: tango
+theme: spacelab
 ---
 
 ```{r setup, include=FALSE}
@@ -16,16 +16,19 @@ library(magrittr)
 library(purrrlyr)
 library(glue)
 library(forcats)
+library(rlang)
 library(langcog)
 theme_set(theme_mikabr())
 ```
 
 ```{r ops}
 # meaning = one row of meanings df
-meanings <- data_frame(
-  "A" = c(FALSE, FALSE, TRUE, TRUE),
-  "B" = c(FALSE, TRUE, FALSE, TRUE)
-)
+# meanings <- data_frame(
+#   "A" = c(FALSE, FALSE, TRUE, TRUE),
+#   "B" = c(FALSE, TRUE, FALSE, TRUE)
+# )
+
+meanings <- cross_df(list(B = c(FALSE, TRUE), A = c(FALSE, TRUE)))
 
 # lexicon = subset of columns of operators df
 operators <- meanings %>%
@@ -53,10 +56,12 @@ namify_val <- function(names, val) {
 }
 
 default_params <- list(
-  meaning_prior = function(meaning) 1 / nrow(meanings),
+  meaning_prior = function(meaning) log(1 / nrow(meanings)),
   utterance_cost = namify_val(names(operators), 0),
   utterance_weight = namify_val(names(operators), 1),
-  lambda = 3
+  lambda = 3,
+  alpha = 1,
+  n = 2
 )
 ```
 
@@ -65,22 +70,22 @@ A literal listener $L_0$ interprets an utterance $u$ using their prior over mean
 $$ L_0(m|u,\mathcal{L}) \propto \mathcal{L}(m,u) \cdot P(m)$$
 
 ```{r}
-listener_literal <- function(lexicon, params) {
-  function(meaning, utterance) {
-    
-    # set of meanings consistent with utterance
-    utterance_meanings <- meanings[which(lexicon[[utterance]]),]
-    
-    p_meaning <- function(m_i) {
-      valid <- utterance_meanings %>% filter(A == m_i$A, B == m_i$B) %>% nrow()
-      if (valid) params$meaning_prior(m_i) else 0
-    }
-    
-    total <- meanings %>% by_row(p_meaning, .collate = "cols") %$%
-      .out %>% sum(na.rm = TRUE)
-    log(p_meaning(meaning)) - log(total)
-  }
-}
+# listener_literal <- function(lexicon, params) {
+#   function(meaning, utterance) {
+#     
+#     # set of meanings consistent with utterance
+#     utterance_meanings <- meanings[which(lexicon[[utterance]]),]
+#     
+#     p_meaning <- function(m_i) {
+#       valid <- utterance_meanings %>% filter(A == m_i$A, B == m_i$B) %>% nrow()
+#       if (valid) params$meaning_prior(m_i) else 0
+#     }
+#     
+#     total <- meanings %>% by_row(p_meaning, .collate = "cols") %$%
+#       .out %>% sum(na.rm = TRUE)
+#     log(p_meaning(meaning)) - log(total)
+#   }
+# }
 ```
 
 A pragmatic speaker chooses a utterance $u$ given an meaning $m$ to which they want to refer such that they soft-maximize the probability that the listener will assign to that meaning:
@@ -90,16 +95,16 @@ $$ S_n(u|m,\mathcal{L}) \propto \text{exp} (\lambda (\log{L_{n-1}(m|u,\mathcal{L
 ```{r}
 # level n pragmatic speaker's log posterior of utterance given meaning and lexicon
 # n ∈ {1, 3, 5, ...}
-speaker_n <- function(n, lexicon, params) {
-  function(meaning, utterance) {
-    p_utterance <- function(u_i) {
-      params$lambda * (listener_n(n - 1, lexicon, params)(meaning, u_i) -
-                         params$utterance_cost[u_i])
-    }
-    total <- sum(exp(map_dbl(names(lexicon), p_utterance)), na.rm = TRUE)
-    if (total == 0) -Inf else p_utterance(utterance) - log(total)
-  }
-}
+# speaker_n <- function(n, lexicon, params) {
+#   function(meaning, utterance) {
+#     p_utterance <- function(u_i) {
+#       params$lambda * (listener_n(n - 1, lexicon, params)(meaning, u_i) -
+#                          params$utterance_cost[u_i])
+#     }
+#     total <- sum(exp(map_dbl(names(lexicon), p_utterance)), na.rm = TRUE)
+#     if (total == 0) -Inf else p_utterance(utterance) - log(total)
+#   }
+# }
 ```
 
 A pragmatic listener, in turn, uses Bayes' rule to in invert the speaker's decision rule:
@@ -109,226 +114,419 @@ $$ L_n(m|u,\mathcal{L}) \propto S_{n-1}(u|m,\mathcal{L}) \cdot P(m) $$
 ```{r}
 # level n pragmatic listener's log posterior of meaning given utterance and lexicon
 # n ∈ {0, 2, 4, ...}
-listener_n <- function(n, lexicon, params) {
+# listener_n <- function(n, lexicon, params) {
+#   if (n == 0) {
+#     listener_literal(lexicon, params)
+#   } else {
+#     function(meaning, utterance) {
+#       p_meaning <- function(m_i) {
+#         speaker_n(n - 1, lexicon, params)(m_i, utterance) + 
+#           params$meaning_prior(m_i)
+#       }
+#       total <- meanings %>% by_row(p_meaning, .collate = "cols") %$%
+#         .out %>% exp() %>% sum(na.rm = TRUE)
+#       p_meaning(meaning) - log(total)
+#     }
+#   }
+# }
+```
+
+```{r}
+sum_logs <- function(x, na.rm = TRUE) log(sum(exp(x), na.rm = na.rm))
+
+evaluate_lexicon_level <- function(world, lexicon, params, n) {
+
+  literal <- function(m, u)
+    meanings[which(lexicon[[u]]),] %>% filter(A == m$A, B == m$B) %>% nrow()
+  
   if (n == 0) {
-    listener_literal(lexicon, params)
+    # literal listener (level 0)
+    world <- world %>%
+      mutate(literal = map2_dbl(meaning, utterance, literal),
+             listener_0 = log(literal) + meaning_prior) %>%
+      group_by(utterance) %>%
+      mutate(listener_0 = listener_0 - sum_logs(listener_0))
+    
+  } else if (n %% 2) {
+    # pragmatic speaker (level 1, 3, etc)
+    previous <- glue("listener_{n-1}")
+    this <- glue("speaker_{n}")
+    if (!(quo_name(previous) %in% names(world)))
+      world <- evaluate_lexicon_level(world, lexicon, params, n - 1)
+    world <- world %>%
+      mutate(previous = !!sym(previous),
+             this = params$lambda * (previous - utterance_cost)) %>%
+      group_by(meaning_str) %>%
+      mutate(!!this := this - sum_logs(this)) %>%
+      select(-previous, -this)
+    
   } else {
-    function(meaning, utterance) {
-      p_meaning <- function(m_i) {
-        speaker_n(n - 1, lexicon, params)(m_i, utterance) + 
-          params$meaning_prior(m_i)
-      }
-      total <- meanings %>% by_row(p_meaning, .collate = "cols") %$%
-        .out %>% exp() %>% sum(na.rm = TRUE)
-      p_meaning(meaning) - log(total)
-    }
+    # pragmatic listener (level 2, 4, etc)
+    previous <- glue("speaker_{n-1}")
+    this <- glue("listener_{n}")
+    if (!(previous %in% names(world)))
+      world <- evaluate_lexicon_level(world, lexicon, params, n - 1)
+    world <- world %>%
+      mutate(previous = !!sym(previous),
+             this = previous + meaning_prior) %>%
+      group_by(utterance) %>%
+      mutate(!!this := this - sum_logs(this)) %>%
+      select(-previous, -this)
   }
+  
+  return(world)
 }
+
+evaluate_lexicon <- function(lexicon, params) {
+  
+  world <- names(lexicon) %>%
+    map_df(~meanings %>% mutate(utterance = .x)) %>%
+    mutate(meaning = map2(A, B, ~data_frame(A = .x, B = .y)),
+           meaning_str = glue("A={A}, B={B}")) %>%
+    select(utterance, meaning, meaning_str) %>%
+    mutate(utterance_cost = params$utterance_cost[utterance],
+           meaning_prior = params$meaning(meaning))
+  
+  eval <- evaluate_lexicon_level(world, lexicon, params, n = params$n)
+  score <- sum(exp(eval$meaning_prior +
+                     eval[[glue("listener_{params$n}")]] +
+                     eval[[glue("speaker_{params$n-1}")]]),
+               na.rm = TRUE)
+  score <- eval$meaning_prior
+  if (glue("listener_{params$n}") %in% names(eval))
+    score <- score + eval[[glue("listener_{params$n}")]]
+  if (glue("speaker_{params$n-1}") %in% names(eval))
+    score <- score + eval[[glue("speaker_{params$n-1}")]]
+  score <- sum(exp(score), na.rm = TRUE)
+  eval %>% mutate(score = score)
+  
+}
+
+# lexicon_cost <- function(lexicon, params) {
+#   params$alpha * sum(params$utterance_weight[names(lexicon)])
+# }
 ```
 
 ```{r}
-type_interp <- function(type, lexicon, params, utterance) {
-  if (type == "literal") {
-    interp_fun <- listener_literal(lexicon, params)
-  } else if (type == "pragmatic") {
-    interp_fun <- listener_n(2, lexicon, params)
-  }
-  meanings %>%
-    by_row(~interp_fun(.x, utterance), .collate = "cols") %>%
-    rename(p = .out) %>%
-    mutate(p = exp(p),
-           utterance = utterance,
-           meaning = sprintf("A = %d\nB = %d", A, B),
-           type = type)
-}
-
-interp <- function(lexicon, params) {
-  map_df(c("literal", "pragmatic"),
-                 function(t) map_df(names(lexicon),
-                                    ~type_interp(t, lexicon, params, .x)))
-}
-
-plot_interp <- function(interp) {
-  ggplot(typical_interp, aes(x = meaning, y = p)) +
-    facet_grid(type ~ utterance) +
-    geom_bar(stat = "identity") +
-    labs(x = "meaning", y = "P(meaning | utterance)",
-         title = "Listener interpretation")
-}
-
-typical_lexicon <- operators %>% select(AND, OR)
-typical_interp <- interp(typical_lexicon, default_params)
-```
-
-```{r}
-ggplot(typical_interp, aes(x = meaning, y = p)) +
-  facet_grid(type ~ utterance) +
-  geom_bar(stat = "identity") +
-  labs(x = "meaning", y = "P(meaning | utterance)",
-       title = "Listener interpretation")
-```
-
-```{r}
-get_lexicon_eval <- function(lexicon, params) {
-  names(lexicon) %>%
-    map_df(function(utt) {
-      meanings %>%
-        by_row(~speaker_n(1, lexicon, params)(.x, utt), .collate = "cols") %>%
-        rename(speaker_p = .out) %>%
-        by_row(~listener_n(2, lexicon, params)(.x, utt), .collate = "cols") %>%
-        rename(listener_p = .out) %>%
-        mutate(utterance = utt)
-    })
-}
-
-lexicon_score <- function(lexicon_eval, params) {
-  lexicon_eval %>%
-    mutate(prior = params$meaning_prior(list(A = A, B = B)),
-           weight = params$utterance_weight[utterance]) %$%
-    sum(exp(speaker_p + listener_p) * prior * weight, na.rm = TRUE)
-}
+# get_lexicon_eval <- function(lexicon, params) {
+#   names(lexicon) %>%
+#     map_df(function(utt) {
+#       meanings %>%
+#         by_row(~speaker_n(1, lexicon, params)(.x, utt), .collate = "cols",
+#                .to = "speaker_p") %>%
+#         by_row(~listener_n(2, lexicon, params)(.x, utt), .collate = "cols",
+#                .to = "listener_p") %>%
+#         mutate(utterance = utt)
+#     })
+# }
+# 
+# lexicon_score <- function(lexicon_eval, params) {
+#   lexicon_eval %>%
+#     mutate(prior = params$meaning_prior(list(A = A, B = B))) %$%
+#     sum(exp(speaker_p + listener_p) * prior, na.rm = TRUE)
+# }
+# 
+# lexicon_cost <- function(lexicon, params) {
+#   params$alpha * sum(params$utterance_weight[lexicon])
+# }
 ```
 
 ```{r}
 # evaluate all operator inventories of size k
-get_inventories_eval <- function(k, params) {
+evaluate_inventories_k <- function(k, params) {
   inventories <- combn(names(operators), k, simplify = FALSE)
-  # inv <- data_frame(inventory = inventories) %>%
-  #   mutate(lexicon_eval = get_lexicon_eval(operators %>% select_(.dots = inventory),
-  #                                          params))
-  1:length(inventories) %>%
-    map_df(function(i) {
-      print(glue("inventory {i} out of {length(inventories)}"))
-      get_lexicon_eval(operators %>% select_(.dots = inventories[[i]]), params) %>%
-        mutate(i = i) #%>%
-    })
-    # group_by(i) %>%
-    # nest() %>%
-    # mutate(score = map_dbl(data, ~lexicon_score(.x, params))) %>%
-    # unnest()
+  map_df(1:length(inventories), function(i) {
+    lexicon <- operators %>% select(!!inventories[[i]])
+    evaluate_lexicon(lexicon, params) %>% mutate(i = i)
+  })
 }
 
-get_inventories_scores <- function(inventories_eval, params) {
-  inventories_eval %>%
-    
-    group_by(i) %>%
-    nest() %>%
-    mutate(score = map_dbl(data, ~lexicon_score(.x, params))) %>%
-    unnest() %>%
-    
-    distinct(i, utterance, score) %>%
-    group_by(i) %>%
-    mutate(op = sprintf("operator_%s", 1:n())) %>%
-    spread(op, utterance) %>%
-    ungroup() %>%
-    mutate_if(is.character, as_factor)
+# evaluate all operator inventories of size n and less
+evaluate_inventories <- function(n, params) {
+  map_df(1:n, function(k) {
+    print(glue("inventories of size {k}"))
+    evaluate_inventories_k(k, params) %>% mutate(size = k)
+  })
 }
+
+# get_inventories_scores <- function(inventories_eval, params) {
+#   inventories_eval %>%
+#     group_by(i) %>%
+#     nest() %>%
+#     mutate(score = map_dbl(data, ~lexicon_score(.x, params)),
+#            cost = map_dbl(data,
+#                           ~lexicon_cost(unique(.x$utterance), params)),
+#            utility = score - cost) %>%
+#     unnest() %>%
+#     distinct(i, utterance, score, cost, utility) %>%
+#     group_by(i) %>%
+#     mutate(op = sprintf("operator_%s", 1:n())) %>%
+#     spread(op, utterance) %>%
+#     ungroup() %>%
+#     mutate_if(is.character, as_factor)
+# }
 ```
 
 ```{r}
-inventories_2_eval <- get_inventories_eval(2, default_params)
-inventories_2_scores <- get_inventories_scores(inventories_2_eval)
+min_gates <- function(primitives) {
+  
+}
+```
 
-inventories_2_scores %>%
-  select(operator_1, operator_2, score) %>%
-  arrange(desc(score))
+
+```{r}
+inventories_4 <- evaluate_inventories(4, default_params)
+
+andor_mdl <- function(utterance) {
+  case_when(
+    utterance == "NO" ~ 0,
+    utterance == "AND" ~ 1,
+    utterance == "NOT_IMPLIES" ~ 2,
+    utterance == "A" ~ 0,
+    utterance == "NOT_CONV_IMPLIES" ~ 2,
+    utterance == "B" ~ 0,
+    utterance == "XOR" ~ 4,
+    utterance == "OR" ~ 1,
+    utterance == "NOR" ~ 2,
+    utterance == "XNOR" ~ 4,
+    utterance == "NOT_B" ~ 1,
+    utterance == "IMPLIES" ~ 2,
+    utterance == "NOT_A" ~ 1,
+    utterance == "CONV_IMPLIES" ~ 2,
+    utterance == "NAND" ~ 2,
+    utterance == "YES" ~ 0
+  )
+}
+
+# no_prag_params <- default_params
+# no_prag_params$n <- 0
+# inventories_literal_2 <- evaluate_inventories(2, no_prag_params)
+# inventories_literal_4 <- evaluate_inventories(4, no_prag_params)
+
+limited <- c("AND", "OR", "NAND", "NOR")
+non_binary <- c("NO", "YES", "A", "NOT_A", "B", "NOT_B")
+
+alpha <- 0.1
+inventories_4_mdl <- inventories_4 %>%
+  mutate(mdl = andor_mdl(utterance),
+         limited = utterance %in% limited,
+         binary = !(utterance %in% non_binary)) %>%
+  distinct(size, i, score, utterance, mdl, limited, binary) %>%
+  group_by(size, i, score) %>%
+  summarise(lexicon = paste(unique(utterance), collapse = ", "),
+            lexicon_mdl = sum(mdl),
+            limited = all(limited),
+            binary = all(binary),
+            target = lexicon == "AND, OR, NOR") %>%
+  mutate(utility = score - alpha * lexicon_mdl) %>%
+  arrange(desc(utility))
+```
+
+```{r}
+ggplot(inventories_4_mdl,
+       aes(x = score, y = lexicon_mdl, colour = factor(size))) +
+  geom_abline(intercept = -3, slope = 10, colour = "darkgrey",
+              linetype = "dotted") +
+  geom_point(data = filter(inventories_4_mdl, !target), shape = 20) +
+  geom_point(data = filter(inventories_4_mdl, target), shape = 18, size = 5) +
+  scale_colour_solarized(name = "size") +
+  lims(x = c(0, 1)) +
+  guides(colour = guide_legend(override.aes = list(shape = 20)))
+```
+
+```{r}
+inventories_4_limited <- filter(inventories_4_mdl, limited)
+ggplot(inventories_4_limited,
+       aes(x = score, y = lexicon_mdl, colour = factor(size))) +
+  geom_abline(intercept = -3, slope = 10, colour = "darkgrey",
+              linetype = "dotted") +
+  geom_point(data = filter(inventories_4_limited, !target), shape = 20) +
+  geom_point(data = filter(inventories_4_limited, target), shape = 18,
+             size = 5) +
+  scale_colour_solarized(name = "size") +
+  lims(x = c(0, 1)) +
+  guides(colour = guide_legend(override.aes = list(shape = 20)))
+```
+
+```{r}
+inventories_4_binary <- filter(inventories_4_mdl, binary)
+ggplot(inventories_4_binary,
+       aes(x = score, y = lexicon_mdl, colour = factor(size))) +
+  geom_abline(intercept = -2.2, slope = 8.4, colour = "darkgrey",
+              linetype = "dotted") +
+  geom_point(data = filter(inventories_4_binary, !target), shape = 20) +
+  geom_point(data = filter(inventories_4_binary, target), shape = 18,
+             size = 5) +
+  scale_colour_solarized(name = "size") +
+  lims(x = c(0, 1)) +
+  guides(colour = guide_legend(override.aes = list(shape = 20)))
+```
+
+```{r}
+# inventories_2_eval <- get_inventories_eval(2, default_params)
+# inventories_2_scores <- get_inventories_scores(inventories_2_eval,
+#                                                default_params)
+# 
+# inventories_2_scores %>%
+#   select(operator_1, operator_2, score) %>%
+#   arrange(desc(score))
 ```
 
 ```{r, fig.width=4, fig.height=4}
-ggplot(inventories_2_scores, aes(x = operator_1, y = operator_2)) +
-  coord_equal() +
-  geom_tile(aes(fill = score)) +
-  scale_fill_gradient(low = solarized_palette(2)[1],
-                      high = solarized_palette(2)[2]) +
-  labs(x = "", y = "") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# ggplot(inventories_2_scores, aes(x = operator_1, y = operator_2)) +
+#   coord_equal() +
+#   geom_tile(aes(fill = score)) +
+#   scale_fill_gradient(low = solarized_palette(2)[1],
+#                       high = solarized_palette(2)[2]) +
+#   labs(x = "", y = "") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
 ```{r}
-inventories_3_eval <- get_inventories_eval(3, default_params)
-inventories_3_scores <- get_inventories_scores(inventories_3_eval, default_params)
-
-inventories_3_scores %>%
-  select(operator_1, operator_2, operator_3, score) %>%
-  arrange(desc(score))
+# inventories_3_eval <- get_inventories_eval(3, default_params)
+# inventories_3_scores <- get_inventories_scores(inventories_3_eval, default_params)
+# 
+# inventories_3_scores %>%
+#   select(operator_1, operator_2, operator_3, score) %>%
+#   arrange(desc(score))
 ```
 
 ```{r}
 # non-uniform prior over meanings such that predicates tend to be false
 # p = parameter of how likely any predicate is to be true
-meaning_prior_params <- function(p) {
-  params <- default_params
-  params$meaning_prior <- function(meaning) {
-    num_true <- meaning$A + meaning$B
-    p ^ num_true * (1 - p) ^ (2 - num_true)
+# meaning_prior_params <- function(p) {
+#   params <- default_params
+#   params$meaning_prior <- function(meaning) {
+#     num_true <- meaning$A + meaning$B
+#     p ^ num_true * (1 - p) ^ (2 - num_true)
+#   }
+#   params
+# }
+```
+
+```{r}
+# skewed_3_eval <- get_inventories_eval(3, meaning_prior_params(0.1))
+# skewed_3_scores <- get_inventories_scores(skewed_3_eval)
+# 
+# skewed_3_scores %>%
+#   select(operator_1, operator_2, operator_3, score) %>%
+#   arrange(desc(score))
+```
+
+```{r}
+unary_ops <- list(
+  "NOT" = function(A) !A
+)
+
+binary_ops <- list(
+  "NO" = function(A, B) rep(FALSE, length(A)),
+  "AND" = function(A, B) A & B,
+  "NOT_IMPLIES" = function(A, B) A & !B,
+  "A" = function(A, B) A,
+  "NOT_CONV_IMPLIES" = function(A, B) !A & B,
+  "B" = function(A, B) B,
+  "XOR" = function(A, B) xor(A, B),
+  "OR" = function(A, B) A | B,
+  "NOR" = function(A, B) !(A | B),
+  "XNOR" = function(A, B) !xor(A, B),
+  "NOT_B" = function(A, B) !B,
+  "IMPLIES" = function(A, B) A | !B,
+  "NOT_A" = function(A, B) !A,
+  "CONV_IMPLIES" = function(A, B) !A | B,
+  "NAND" = function(A, B) !(A & B),
+  "YES" = function(A, B) rep(TRUE, length(A))
+)
+
+A <- c(F, F, T, T)
+B <- c(F, T, F, T)
+targets <- map(binary_ops, ~.x(A, B))
+
+count_gates <- function(gates) {
+  str_count(gates, "<[A-Z]*>")
+}
+
+add_level <- function(primitives, available, mins, level) {
+  print(level)
+  
+  # which available bit values are in targets
+  done_gates <- names(targets) %>%
+    map(function(t) {
+      available %>% keep(~all(.x == targets[[t]])) %>% names()
+    }) %>%
+    set_names(names(targets)) %>%
+    compact()
+  done_gates <- done_gates[!(names(done_gates) %in% names(mins))]
+  
+  # done_size <- done_gates %>% map(~str_count(.x, "<[A-Z]*>"))
+  done_size <- done_gates %>% map(count_gates)
+  done <- list(gates = done_gates, size = done_size, level = rep(level, length(done_gates))) %>% transpose()
+
+  new_mins <- c(mins, done)
+  
+  # if all targets exhausted, return
+  if (all(names(targets) %in% names(mins))) return(mins)
+  
+  # otherwise, make every combination of primitives operating on available bit values
+  if ("NOT" %in% primitives) {
+    new_unary <- map(available, ~unary_ops[["NOT"]](.x)) %>%
+      set_names(map(names(available), ~glue("<NOT>({.x})")))
+  } else {
+    new_unary <- list()
   }
-  params
+  combos <- cross2(names(available), names(available))
+  new_binary <- primitives %>% discard(~.x == "NOT") %>%
+    map(function(prim) {
+      map(combos, function(comb) {
+        binary_ops[[prim]](available[[comb[[1]]]], available[[comb[[2]]]])
+      }) %>%
+        set_names(map(combos, ~glue("<{prim}>({paste(.x, collapse = ',')})")))
+    }) %>% flatten()
+  new_all <- c(available, new_unary, new_binary)
+
+  new_min <- data_frame(gates = names(new_all), value = new_all) %>%
+    mutate(value_str = paste(value),
+           size = count_gates(gates)) %>%
+    group_by(value_str) %>%
+    filter(size == min(size)) %>%
+    distinct(value_str, size, .keep_all = TRUE)
+  
+  new_available <- set_names(new_min$value, new_min$gates)
+
+  # recurse with new available bit values
+  add_level(primitives, new_available, new_mins, level + 1)
+}
+
+min_ops <- function(primitives, inputs = c("A", "B", "YES", "NO")) {
+  # start with bit values of inputs
+  add_level(primitives, available = targets[inputs], mins = list(), level = 0)
 }
 ```
 
 ```{r}
-skewed_3_eval <- get_inventories_eval(3, meaning_prior_params(0.1))
-skewed_3_scores <- get_inventories_scores(skewed_3_eval)
-
-skewed_3_scores %>%
-  select(operator_1, operator_2, operator_3, score) %>%
-  arrange(desc(score))
+# library(rPython)
+# python.load("Gates.py")
+# 
+# operator_k <- function(primitives, inputs = c("A", "B", "YES", "NO")) {
+#   python.assign("primitives", primitives)
+#   python.assign("inputs", inputs)
+#   results <- python.call("min_circuits", primitives, inputs)
+#   gates <- python.get("gates")
+#   gate_names <- gates[names(results)]
+#   results %>% set_names(gate_names) %>% transpose() %>% .[[1]] %>% unlist()
+# }
+# 
+# # operator_k(c("AND", "OR", "NOT_A", "NOT_B"))
+# operator_k(c("AND", "OR"))
+# operator_k(c("AND", "NAND"))
 ```
 
 ```{r}
-# ops <- list(
-#   "NO" = function(A, B) FALSE,
-#   "AND" = function(A, B) A & B,
-#   "NOT_IMPLIES" = function(A, B) A & !B,
-#   "A" = function(A, B) A,
-#   "NOT_CONV_IMPLIES" = function(A, B) !A & B,
-#   "B" = function(A, B) B,
-#   "XOR" = function(A, B) xor(A, B),
-#   "OR" = function(A, B) A | B,
-#   "NOR" = function(A, B) !(A | B),
-#   "XNOR" = function(A, B) !xor(A, B),
-#   "NOT_B" = function(A, B) !B,
-#   "IMPLIES" = function(A, B) A | !B,
-#   "NOT_A" = function(A, B) !A,
-#   "CONV_IMPLIES" = function(A, B) !A | B,
-#   "NAND" = function(A, B) !(A & B),
-#   "YES" = function(A, B) TRUE
-#   )
-# 
-# # reduces <- function(operator, expression) {
-# #   meanings %>% mutate(op = ops[[operator]](A, B))
-# # }
-# 
-# # given two vectors of inputs, return operator's output
-# operate <- function(operator, A, B) {
-#   map2_lgl(A, B, ~ops[[operator]](.x, .y))
-# }
-# 
-# function(primitives, inputs = c("A", "B")) {
-#   
-# }
-# 
-# operator_weight <- function(operator, primitives) {
-#   return(1)
-# }
-```
-
-```{r}
-library(rPython)
-python.load("Gates.py")
-
-operator_k <- function(primitives, inputs = c("A", "B")) {
-  python.assign("primitives", primitives)
-  python.assign("inputs", inputs)
-  results <- python.call("min_circuits", primitives, inputs)
-  gates <- python.get("gates")
-  gate_names <- gates[names(results)]
-  results %>% set_names(gate_names) %>% transpose() %>% .[[1]] %>% unlist()
+mdl_inventories <- function(primitives, inputs) {
+  primitive_sets <- combn(names(operators), 2, simplify = FALSE)
+  map()
 }
-
-operator_k(c("AND", "OR", "NOT_A", "NOT_B"))
-#operator_k(c("AND"))
 ```
+
 
 ```{r}
 utterance_weight_params <- function(primitives, inputs = c("A", "B")) {
@@ -351,4 +549,46 @@ MDL_3_scores %>%
   left_join(inventories_3_scores %>%
               select(operator_1, operator_2, operator_3, score)) %>%
   arrange(desc(MDL_score))
+```
+
+```{r}
+type_interp <- function(type, lexicon, params, utterance) {
+  if (type == "literal") {
+    interp_fun <- listener_literal(lexicon, params)
+  } else if (type == "pragmatic") {
+    interp_fun <- listener_n(2, lexicon, params)
+  }
+  meanings %>%
+    by_row(~interp_fun(.x, utterance), .collate = "cols") %>%
+    rename(p = .out) %>%
+    mutate(p = exp(p),
+           utterance = utterance,
+           meaning = sprintf("A = %d\nB = %d", A, B),
+           type = type)
+}
+
+interp <- function(lexicon, params) {
+  map_df(c("literal", "pragmatic"),
+         function(t) map_df(names(lexicon),
+                            ~type_interp(t, lexicon, params, .x)))
+}
+
+plot_interp <- function(interp) {
+  ggplot(typical_interp, aes(x = meaning, y = p)) +
+    facet_grid(type ~ utterance) +
+    geom_bar(stat = "identity") +
+    labs(x = "meaning", y = "P(meaning | utterance)",
+         title = "Listener interpretation")
+}
+
+typical_lexicon <- operators %>% select(AND, OR)
+typical_interp <- interp(typical_lexicon, default_params)
+```
+
+```{r}
+ggplot(typical_interp, aes(x = meaning, y = p)) +
+  facet_grid(type ~ utterance) +
+  geom_bar(stat = "identity") +
+  labs(x = "meaning", y = "P(meaning | utterance)",
+       title = "Listener interpretation")
 ```
